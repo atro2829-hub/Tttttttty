@@ -58,10 +58,10 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
-    type TEXT, -- 'deposit', 'withdrawal', 'interest', 'referral'
+    type TEXT,
     amount REAL,
-    method TEXT, -- 'binance', 'usdt_trc20', 'usdt_erc20', 'usdt_bep20'
-    status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'failed'
+    method TEXT,
+    status TEXT DEFAULT 'pending',
     details TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(user_id) REFERENCES users(id)
@@ -178,6 +178,7 @@ async function startServer() {
     });
   });
 
+  // Investments
   app.post('/api/investments/join', authenticateToken, (req: any, res) => {
     const { planId, amount } = req.body;
     const user = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id) as any;
@@ -200,7 +201,7 @@ async function startServer() {
     res.json({ message: 'Investment successful' });
   });
 
-  // Transactions
+  // Transactions (Deposit & Withdraw)
   app.post('/api/transactions/deposit', authenticateToken, (req: any, res) => {
     const { amount, method, details } = req.body;
     db.prepare('INSERT INTO transactions (user_id, type, amount, method, details, status) VALUES (?, ?, ?, ?, ?, ?)')
@@ -208,127 +209,4 @@ async function startServer() {
     res.json({ message: 'Deposit request submitted' });
   });
 
-  app.post('/api/transactions/withdraw', authenticateToken, (req: any, res) => {
-    const { amount, method, details } = req.body;
-    const user = db.prepare('SELECT balance FROM users WHERE id = ?').get(req.user.id) as any;
-    
-    if (user.balance < amount) return res.status(400).json({ error: 'Insufficient balance' });
-
-    const transaction = db.transaction(() => {
-      db.prepare('UPDATE users SET balance = balance - ? WHERE id = ?').run(amount, req.user.id);
-      db.prepare('INSERT INTO transactions (user_id, type, amount, method, details, status) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(req.user.id, 'withdrawal', amount, method, details, 'pending');
-    });
-
-    transaction();
-    res.json({ message: 'Withdrawal request submitted' });
-  });
-
-  app.get('/api/transactions/history', authenticateToken, (req: any, res) => {
-    const history = db.prepare('SELECT * FROM transactions WHERE user_id = ? ORDER BY created_at DESC').all(req.user.id);
-    res.json(history);
-  });
-
-  // Admin Routes
-  app.get('/api/admin/users', authenticateToken, isAdmin, (req, res) => {
-    const users = db.prepare('SELECT id, email, full_name, balance, role, created_at FROM users').all();
-    res.json(users);
-  });
-
-  app.get('/api/admin/transactions', authenticateToken, isAdmin, (req, res) => {
-    const transactions = db.prepare(`
-      SELECT t.*, u.email as user_email 
-      FROM transactions t 
-      JOIN users u ON t.user_id = u.id 
-      ORDER BY t.created_at DESC
-    `).all();
-    res.json(transactions);
-  });
-
-  app.post('/api/admin/transactions/:id/approve', authenticateToken, isAdmin, (req, res) => {
-    const { id } = req.params;
-    const tx = db.prepare('SELECT * FROM transactions WHERE id = ?').get(id) as any;
-    if (!tx) return res.status(404).json({ error: 'Transaction not found' });
-    if (tx.status !== 'pending') return res.status(400).json({ error: 'Transaction already processed' });
-
-    const transaction = db.transaction(() => {
-      db.prepare('UPDATE transactions SET status = ? WHERE id = ?').run('completed', id);
-      if (tx.type === 'deposit') {
-        db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(tx.amount, tx.user_id);
-        
-        // Referral commission (10%)
-        const user = db.prepare('SELECT referred_by FROM users WHERE id = ?').get(tx.user_id) as any;
-        if (user.referred_by) {
-          const referrer = db.prepare('SELECT id FROM users WHERE referral_code = ?').get(user.referred_by) as any;
-          if (referrer) {
-            const commission = tx.amount * 0.1;
-            db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(commission, referrer.id);
-            db.prepare('INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, ?, ?, ?, ?)')
-              .run(referrer.id, 'referral', commission, 'completed', `Referral commission from ${tx.user_id}`);
-          }
-        }
-      }
-    });
-
-    transaction();
-    res.json({ message: 'Transaction approved' });
-  });
-
-  // Interest Calculation Cron (Simulated with interval)
-  setInterval(() => {
-    const activeInvestments = db.prepare(`
-      SELECT i.*, p.interest_rate 
-      FROM investments i 
-      JOIN plans p ON i.plan_id = p.id 
-      WHERE i.status = 'active'
-    `).all() as any[];
-
-    const now = new Date();
-    activeInvestments.forEach(inv => {
-      const lastCalc = new Date(inv.last_interest_calc);
-      const diffHours = (now.getTime() - lastCalc.getTime()) / (1000 * 60 * 60);
-      
-      // Calculate interest every 24 hours (simulated for demo, maybe every minute for testing)
-      if (diffHours >= 24) {
-        const dailyInterest = (inv.amount * (inv.interest_rate / 100));
-        const transaction = db.transaction(() => {
-          db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(dailyInterest, inv.user_id);
-          db.prepare('UPDATE investments SET last_interest_calc = ? WHERE id = ?').run(now.toISOString(), inv.id);
-          db.prepare('INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, ?, ?, ?, ?)')
-            .run(inv.user_id, 'interest', dailyInterest, 'completed', `Daily interest from ${inv.plan_id} plan`);
-          
-          // Check if investment ended
-          if (new Date(inv.end_date) <= now) {
-            db.prepare('UPDATE investments SET status = ? WHERE id = ?').run('completed', inv.id);
-            db.prepare('UPDATE users SET balance = balance + ? WHERE id = ?').run(inv.amount, inv.user_id);
-            db.prepare('INSERT INTO transactions (user_id, type, amount, status, details) VALUES (?, ?, ?, ?, ?)')
-              .run(inv.user_id, 'payout', inv.amount, 'completed', `Investment principal returned`);
-          }
-        });
-        transaction();
-      }
-    });
-  }, 60000); // Check every minute
-
-  // Vite middleware
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  const PORT = 3000;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
-}
-
-startServer();
+  app.post('/api/transactions/withdraw', authenticateToken, (req: any, res)
